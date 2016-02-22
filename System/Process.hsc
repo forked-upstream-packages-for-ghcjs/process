@@ -8,6 +8,10 @@
 {-# LANGUAGE InterruptibleFFI #-}
 #endif
 
+##ifdef ghcjs_HOST_OS
+{-# LANGUAGE JavaScriptFFI #-}
+##endif
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  System.Process
@@ -88,10 +92,12 @@ import System.IO
 import System.IO.Error (mkIOError, ioeSetErrorString)
 
 #if defined(mingw32_HOST_OS)
+##if !defined(ghcjs_HOST_OS)
 # include <io.h>        /* for _close and _pipe */
 # include <fcntl.h>     /* for _O_BINARY */
 import Control.Exception (onException)
 import Foreign.C.Types (CInt(..), CUInt(..))
+##endif
 #else
 import System.Posix.Process (getProcessGroupIDOf)
 import qualified System.Posix.IO as Posix
@@ -101,10 +107,14 @@ import System.Posix.Types
 #ifdef __GLASGOW_HASKELL__
 import GHC.IO.Exception ( ioException, IOErrorType(..), IOException(..) )
 # if defined(mingw32_HOST_OS)
+##if !defined(ghcjs_HOST_OS)
 import System.Win32.Console (generateConsoleCtrlEvent, cTRL_BREAK_EVENT)
 import System.Win32.Process (getProcessId)
+##endif
 # else
+##if !defined(ghcjs_HOST_OS)
 import System.Posix.Signals
+##endif
 # endif
 #endif
 
@@ -697,7 +707,8 @@ interruptProcessGroupOf ph = do
         case p_ of
             ClosedHandle _ -> return ()
             OpenHandle h -> do
-#if mingw32_HOST_OS
+##if !defined(ghcjs_HOST_OS)
+#if defined(mingw32_HOST_OS)
                 pid <- getProcessId h
                 generateConsoleCtrlEvent cTRL_BREAK_EVENT pid
 -- We can't use an #elif here, because MIN_VERSION_unix isn't defined
@@ -707,11 +718,29 @@ interruptProcessGroupOf ph = do
                 pgid <- getProcessGroupIDOf h
                 signalProcessGroup sigINT pgid
 #endif
+##endif
                 return ()
 
 
 -- ----------------------------------------------------------------------------
 -- Interface to C bits
+
+##if defined(ghcjs_HOST_OS)
+
+
+foreign import javascript unsafe
+  "h$process_terminateProcess($1)"
+  c_terminateProcess :: PHANDLE -> IO CInt
+
+foreign import javascript unsafe
+  "h$process_getProcessExitCode($1,$2_1,$2_2)"
+  c_getProcessExitCode :: PHANDLE -> Ptr CInt -> IO CInt
+
+foreign import javascript interruptible
+  "h$process_waitForProcess($1,$2_1,$2_2,$c);"
+  c_waitForProcess :: PHANDLE -> Ptr CInt -> IO CInt
+
+##else
 
 foreign import ccall unsafe "terminateProcess"
   c_terminateProcess
@@ -730,6 +759,7 @@ foreign import ccall interruptible "waitForProcess" -- NB. safe - can block
         -> Ptr CInt
         -> IO CInt
 
+##endif
 
 -- ----------------------------------------------------------------------------
 -- Old deprecated variants
@@ -931,6 +961,9 @@ rawSystem cmd args = system (showCommandForUser cmd args)
 --
 -- /Since: 1.2.1.0/
 createPipe :: IO (Handle, Handle)
+##if ghcjs_HOST_OS
+createPipe = error "System.Process.createPipe: not yet supported on GHCJS"
+##else
 #if !mingw32_HOST_OS
 createPipe = do
     (readfd, writefd) <- Posix.createPipe
@@ -957,3 +990,4 @@ foreign import ccall "io.h _pipe" c__pipe ::
 foreign import ccall "io.h _close" c__close ::
     CInt -> IO CInt
 #endif
+##endif

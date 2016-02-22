@@ -5,6 +5,10 @@
 {-# LANGUAGE InterruptibleFFI #-}
 #endif
 
+#ifdef __GHCJS__
+{-# LANGUAGE ForeignFunctionInterface, JavaScriptFFI, UnliftedFFITypes, MagicHash #-}
+#endif
+
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  System.Process.Internals
@@ -34,7 +38,7 @@ module System.Process.Internals (
     startDelegateControlC,
     endDelegateControlC,
     stopDelegateControlC,
-#if !defined(mingw32_HOST_OS) && !defined(__MINGW32__)
+#if !defined(mingw32_HOST_OS) && !defined(__MINGW32__) && !defined(ghcjs_HOST_OS)
     pPrPr_disableITimers, c_execvpe,
     ignoreSignal, defaultSignal,
 #endif
@@ -53,7 +57,7 @@ import Foreign.Ptr
 import Foreign.Storable
 import System.IO.Unsafe
 
-#if !defined(mingw32_HOST_OS) && !defined(__MINGW32__)
+#if !defined(mingw32_HOST_OS) && !defined(__MINGW32__) && !defined(ghcjs_HOST_OS)
 import Control.Monad
 import Data.Char
 import System.IO
@@ -72,10 +76,12 @@ import GHC.IO.Handle.Internals
 import GHC.IO.Handle.Types hiding (ClosedHandle)
 import System.IO.Error
 import Data.Typeable
-# if defined(mingw32_HOST_OS)
+# if defined(mingw32_HOST_OS) || defined(ghcjs_HOST_OS)
 import GHC.IO.IOMode
+# endif
+# if defined(mingw32_HOST_OS)
 import System.Win32.DebugApi (PHANDLE)
-# else
+# elif !defined(ghcjs_HOST_OS)
 import System.Posix.Signals as Sig
 # endif
 #endif
@@ -84,6 +90,11 @@ import System.Posix.Signals as Sig
 import System.Directory         ( doesFileExist )
 import System.Environment       ( getEnv )
 import System.FilePath
+#endif
+
+#if defined(ghcjs_HOST_OS)
+import Control.Applicative
+import GHCJS.Prim
 #endif
 
 #include "HsProcessConfig.h"
@@ -97,6 +108,46 @@ import System.FilePath
 # else
 #  error Unknown mingw32 arch
 # endif
+#endif
+
+#if defined(ghcjs_HOST_OS)
+
+type JSArray  = JSVal
+type JSObject = JSVal
+type JSString = JSVal
+
+fromJSStrings :: JSVal -> IO [String]
+fromJSStrings x = fmap (map fromJSString) (fromJSArray x)
+
+fromJSInts :: JSVal -> IO [Int]
+fromJSInts x = map fromJSInt <$> fromJSArray x
+
+toJSStrings :: [String] -> IO JSVal
+toJSStrings xs = toJSArray (map toJSString xs)
+
+throwErrnoIfJSNull :: String -> IO JSVal -> IO JSVal
+throwErrnoIfJSNull msg m = do
+  r <- m
+  if isNull r then throwErrno msg
+              else return r
+
+foreign import javascript safe
+  "h$process_runInteractiveProcess($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)"
+  js_runInteractiveProcess :: JSString     -- ^ $1 command or program
+                           -> JSArray      -- ^ $2 arguments, null if it's a raw command
+                           -> JSString     -- ^ $3 working dir, null for current
+                           -> JSArray      -- ^ $4 environment, null for existing
+                           -> CInt         -- ^ $5 stdin fd
+                           -> CInt         -- ^ $6 stdout fd
+                           -> CInt         -- ^ $7 stderr fd
+                           -> Bool         -- ^ $8 close handles
+                           -> Bool         -- ^ $9
+                           -> Bool         -- ^ $10 delegate ctrl-c
+                           -> IO JSVal     -- ^ process handle
+
+foreign import javascript safe
+  "h$process_commandToProcess($1,$2)"
+  js_commandToProcess :: JSString -> JSArray -> IO JSArray
 #endif
 
 -- ----------------------------------------------------------------------------
@@ -124,7 +175,19 @@ withProcessHandle
         -> IO a
 withProcessHandle (ProcessHandle m _) io = withMVar m io
 
-#if !defined(mingw32_HOST_OS) && !defined(__MINGW32__)
+#if defined(ghcjs_HOST_OS)
+
+type PHANDLE = Int
+
+mkProcessHandle :: PHANDLE -> Bool -> IO ProcessHandle
+mkProcessHandle p mb_delegate_ctlc = do
+  m <- newMVar (OpenHandle p)
+  return (ProcessHandle m mb_delegate_ctlc)
+
+closePHANDLE :: PHANDLE -> IO ()
+closePHANDLE _ = return ()
+
+#elif !defined(mingw32_HOST_OS) && !defined(__MINGW32__)
 
 type PHANDLE = CPid
 
@@ -243,7 +306,52 @@ createProcess_
   -> CreateProcess
   -> IO (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
 
-#if !defined(mingw32_HOST_OS) && !defined(__MINGW32__)
+#if defined(ghcjs_HOST_OS)
+
+createProcess_ fun CreateProcess{ cmdspec = cmdsp,
+                                  cwd = mb_cwd,
+                                  env = mb_env,
+                                  std_in = mb_stdin,
+                                  std_out = mb_stdout,
+                                  std_err = mb_stderr,
+                                  close_fds = mb_close_fds,
+                                  create_group = mb_create_group,
+                                  delegate_ctlc = mb_delegate_ctlc }
+ = do
+  (cmd,args) <- commandToProcess cmdsp
+  withFilePathException cmd $ do
+     fdin  <- mbFd fun fd_stdin  mb_stdin
+     fdout <- mbFd fun fd_stdout mb_stdout
+     fderr <- mbFd fun fd_stderr mb_stderr
+     env'  <- maybe (return jsNull) (toJSStrings . concatMap (\(x,y) -> [x,y])) mb_env
+     let cwd' = maybe jsNull toJSString mb_cwd
+     (c1,c2) <- case cmdsp of
+       ShellCommand xs    -> return (toJSString xs, jsNull)
+       RawCommand xs args -> (,) (toJSString xs) <$> toJSStrings args
+
+     r <- js_runInteractiveProcess c1 c2 cwd' env' fdin fdout fderr
+         mb_close_fds mb_create_group mb_delegate_ctlc
+
+     proc_handle <- fromJSInt <$> getProp r "pid"
+     fds@[fdin_r, fdout_r, fderr_r] <- map fromIntegral <$> (fromJSInts =<< getProp r "fds")
+
+     hndStdInput  <- mbPipe mb_stdin  fdin_r  WriteMode
+     hndStdOutput <- mbPipe mb_stdout fdout_r ReadMode
+     hndStdError  <- mbPipe mb_stderr fderr_r ReadMode
+
+     ph <- mkProcessHandle proc_handle mb_delegate_ctlc
+     return (hndStdInput, hndStdOutput, hndStdError, ph)
+
+startDelegateControlC :: IO ()
+startDelegateControlC = return ()
+
+stopDelegateControlC :: IO ()
+stopDelegateControlC = return ()
+
+endDelegateControlC :: ExitCode -> IO ()
+endDelegateControlC _ = return ()
+
+#elif !defined(mingw32_HOST_OS) && !defined(__MINGW32__)
 
 #ifdef __GLASGOW_HASKELL__
 
@@ -500,6 +608,31 @@ fd_stdin  = 0
 fd_stdout = 1
 fd_stderr = 2
 
+#ifdef ghcjs_HOST_OS
+
+mbFd :: String -> FD -> StdStream -> IO FD
+mbFd _ _std CreatePipe = return (-1)
+mbFd _fun std Inherit  = return std
+mbFd fun _std (UseHandle hdl) =
+  withHandle fun hdl $ \x@Handle__{haDevice=dev,..} ->
+    case cast dev of
+      Just fd -> return (x, fd)
+      Nothing -> ioError (mkIOError illegalOperationErrorType "createProcess" (Just hdl) Nothing
+                   `ioeSetErrorString` "handle is not a file descriptor")
+
+mbPipe :: StdStream -> FD -> IOMode -> IO (Maybe Handle)
+mbPipe CreatePipe fd mode = do
+  (fD,fd_type) <- FD.mkFD (fromIntegral fd) mode
+                       (Just (Stream,0,0)) -- avoid calling fstat()
+                       False {-is_socket-}
+                       False {-non-blocking-}
+  enc <- getLocaleEncoding
+  fmap Just (mkHandleFromFD fD fd_type ("fd: " ++ show fd) mode False {-is_socket-} (Just enc))
+mbPipe _ _ _ = return Nothing
+
+
+#else
+
 mbFd :: String -> FD -> StdStream -> IO FD
 mbFd _   _std CreatePipe      = return (-1)
 mbFd _fun std Inherit         = return std
@@ -515,6 +648,7 @@ mbFd fun _std (UseHandle hdl) =
           ioError (mkIOError illegalOperationErrorType
                       "createProcess" (Just hdl) Nothing
                    `ioeSetErrorString` "handle is not a file descriptor")
+
 
 mbPipe :: StdStream -> Ptr FD -> IOMode -> IO (Maybe Handle)
 mbPipe CreatePipe pfd  mode = fmap Just (pfdToHandle pfd mode)
@@ -536,6 +670,9 @@ pfdToHandle pfd mode = do
 #endif
   mkHandleFromFD fD' fd_type filepath mode False {-is_socket-} (Just enc)
 
+#endif
+
+
 -- ----------------------------------------------------------------------------
 -- commandToProcess
 
@@ -553,7 +690,21 @@ pfdToHandle pfd mode = do
    Windows isn't required (or desirable) here.
 -}
 
-#if !defined(mingw32_HOST_OS) && !defined(__MINGW32__)
+#if defined(ghcjs_HOST_OS)
+
+commandToProcess :: CmdSpec -> IO (FilePath, [String])
+commandToProcess (ShellCommand xs) = do
+  r <- js_commandToProcess (toJSString xs) jsNull
+  if isNull r
+    then ioError (mkIOError doesNotExistErrorType "commandToProcess" Nothing Nothing)
+    else (\(x:xs) -> (x,xs)) <$> fromJSStrings r
+commandToProcess (RawCommand cmd args) = do
+  r <- js_commandToProcess (toJSString cmd) =<< toJSStrings args
+  if isNull r
+    then ioError (mkIOError doesNotExistErrorType "commandToProcess" Nothing Nothing)
+    else (\(x:xs) -> (x,xs)) <$> fromJSStrings r
+
+#elif !defined(mingw32_HOST_OS) && !defined(__MINGW32__)
 
 commandToProcess :: CmdSpec -> (FilePath, [String])
 commandToProcess (ShellCommand string) = ("/bin/sh", ["-c", string])
@@ -672,7 +823,9 @@ use lpCommandLine alone, which CreateProcess supports.
 -}
 
 translate :: String -> String
-#if mingw32_HOST_OS
+#if defined(ghcjs_HOST_OS)
+translate = id
+#elif defined(mingw32_HOST_OS)
 translate xs = '"' : snd (foldr escape (True,"\"") xs)
   where escape '"'  (_,     str) = (True,  '\\' : '"'  : str)
         escape '\\' (True,  str) = (True,  '\\' : '\\' : str)
@@ -729,7 +882,7 @@ runGenProcess_
  -> Maybe CLong                -- ^ handler for SIGINT
  -> Maybe CLong                -- ^ handler for SIGQUIT
  -> IO (Maybe Handle, Maybe Handle, Maybe Handle, ProcessHandle)
-#if !defined(mingw32_HOST_OS) && !defined(__MINGW32__)
+#if !defined(mingw32_HOST_OS) && !defined(__MINGW32__) && !defined(ghcjs_HOST_OS)
 runGenProcess_ fun c (Just sig) (Just sig') | sig == defaultSignal && sig == sig'
                          = createProcess_ fun c { delegate_ctlc = True }
 runGenProcess_ fun c _ _ = createProcess_ fun c
